@@ -83,6 +83,38 @@ skipped when `AGY_SKIP_DOWNLOAD=1` or `$AGY_BIN` is set.
 | `AGY_EXTRA_ARGS` | Extra args forwarded to every `agy` invocation |
 | `AGY_CONVERSATIONS_DIR` | Custom directory where `agy` writes its conversation SQLite databases |
 
+## BB fork maintenance
+
+This repository is a personal fork of the third-party
+[`shubzkothekar/antigravity-acp`](https://github.com/shubzkothekar/antigravity-acp)
+project, not an official Google ACP implementation. The BB runtime copy was
+installed from npm `antigravity-acp@1.1.0`; all 43 installed files matched the
+npm tarball byte-for-byte. The only local customization was a wrapper that
+warms `~/.agy-acp/models.json` before the ACP server starts, because BB reads
+the model catalog immediately after `session/new`.
+
+This fork is based on upstream `1.2.0` and carries that wrapper as
+`agy-entry.mjs`. It defaults to `agy` on `$PATH`; set `AGY_BIN` to use another
+binary:
+
+```bash
+AGY_BIN=/path/to/agy bun ./agy-entry.mjs
+```
+
+Creating this fork does not upgrade or change the current BB runtime provider
+configuration.
+
+`origin` is `hxy91819/antigravity-acp`; `upstream` is
+`shubzkothekar/antigravity-acp`. Update the fork with:
+
+```bash
+git fetch upstream
+git merge --no-autostash upstream/main
+```
+
+Keep fork-specific changes in `agy-entry.mjs`; there is no separate patch
+registry.
+
 ## Build (Single Executable Application)
 
 ```bash
