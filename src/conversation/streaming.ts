@@ -3,6 +3,7 @@
 // newly-appended agent text and not-yet-sent tool steps on each poll.
 
 import type { SessionUpdate } from "@agentclientprotocol/sdk";
+import type { StepRow } from "../types";
 import type { ErrorDetails } from "./columns";
 import { ConversationDb, ERROR_MESSAGE_STEP_TYPE } from "./database";
 import { newConversationId } from "./scan";
@@ -25,6 +26,7 @@ export class StreamPoller {
 	private db: ConversationDb | null = null;
 	private boundId: string | null;
 	private _quotaError: ErrorDetails | null = null;
+	private _lastRows: StepRow[] = [];
 
 	constructor(private readonly opts: StreamOptions) {
 		this.boundId = opts.conversationId;
@@ -52,6 +54,18 @@ export class StreamPoller {
 		return this.translator.hadUpdates;
 	}
 
+	get lastRows(): StepRow[] {
+		return this._lastRows;
+	}
+
+	bindConversationId(conversationId: string): boolean {
+		if (this.boundId === null) {
+			this.boundId = conversationId;
+			return true;
+		}
+		return this.boundId === conversationId;
+	}
+
 	/** Read steps appended since the turn began and translate the new ones. */
 	poll(): SessionUpdate[] {
 		if (this.boundId === null && this.opts.snapshot !== null) {
@@ -65,6 +79,7 @@ export class StreamPoller {
 		}
 
 		const rows = this.db.readAfter(this.opts.baseStepIdx);
+		this._lastRows = rows;
 		for (const { stepType, error } of rows) {
 			if (
 				error &&

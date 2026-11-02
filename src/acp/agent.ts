@@ -19,7 +19,12 @@ import type {
 	SetSessionConfigOptionResponse,
 } from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
-import { type DiscoveredModel, discoverModels, runNonInteractivePrompt } from "../agy/process";
+import {
+	type DiscoveredModel,
+	detectSteerPlugin,
+	discoverModels,
+	runNonInteractivePrompt,
+} from "../agy/process";
 import { formatUsageOutput } from "../agy/usage-format";
 import {
 	AUTH_METHOD_ID,
@@ -62,6 +67,7 @@ export class AgyAcpAgent {
 	private readonly sessions: SessionManager;
 	private readonly adapter: Adapter;
 	private readonly replayCache = new ReplayCache();
+	private readonly steerPluginReady: Promise<boolean>;
 	private availableModels: DiscoveredModel[] = [];
 	// Tracks which AcpClient is serving each session so async updates can be pushed.
 	private readonly activeClients = new Map<string, AcpClient>();
@@ -74,6 +80,9 @@ export class AgyAcpAgent {
 			workingDir: config.workingDir,
 			skipNarration: config.skipNarration,
 		});
+		this.steerPluginReady = detectSteerPlugin(config.binary).then(
+			(available) => available && process.platform !== "win32",
+		);
 		// Attempt to load models from cache immediately for fast startup.
 		try {
 			if (fs.existsSync(MODELS_CACHE_FILE)) {
@@ -131,8 +140,10 @@ export class AgyAcpAgent {
 		};
 	}
 
-	initialize(): InitializeResponse {
-		return {
+	async initialize(): Promise<InitializeResponse> {
+		const steerAvailable = await this.steerPluginReady;
+		this.adapter.setSteerAvailable(steerAvailable);
+		const response: InitializeResponse = {
 			protocolVersion: 1,
 			agentInfo: { name: "Antigravity", version: this.config.version },
 			agentCapabilities: {
@@ -160,6 +171,9 @@ export class AgyAcpAgent {
 				},
 			],
 		};
+		return steerAvailable
+			? { ...response, _meta: { midTurnSteering: true } }
+			: response;
 	}
 
 	/** ACP authenticate — verify agy binary is accessible (credentials managed by agy). */
@@ -276,6 +290,7 @@ export class AgyAcpAgent {
 		sessionId?: string;
 	}): Promise<DeleteSessionResponse> {
 		const sessionId = this.requireSessionId(params.sessionId);
+		this.adapter.cancel(sessionId);
 		const deleted = await this.sessions.delete(sessionId);
 		if (!deleted) throw RequestError.resourceNotFound(sessionId);
 		this.activeClients.delete(sessionId);
@@ -306,9 +321,25 @@ export class AgyAcpAgent {
 			this.sessions.adopt(sessionId, session);
 		}
 
-		const rawText = promptText(params.prompt);
+		const active = this.adapter.hasActiveRun(sessionId);
 		const userText = rawPromptText(params.prompt).trim();
-		if (userText === "/usage" || userText.startsWith("/usage ")) {
+		const plainText = isPlainTextPrompt(params.prompt);
+		if (active) {
+			if (!plainText) {
+				throw RequestError.invalidParams(
+					undefined,
+					"mid-turn steering supports plain text only",
+				);
+			}
+			if (userText.startsWith("/")) {
+				throw RequestError.invalidParams(
+					undefined,
+					"mid-turn steering does not accept slash commands",
+				);
+			}
+		}
+		const rawText = active ? userText : promptText(params.prompt);
+		if (!active && (userText === "/usage" || userText.startsWith("/usage "))) {
 			const output = await runNonInteractivePrompt(
 				this.config.binary,
 				"/usage",
@@ -329,7 +360,15 @@ export class AgyAcpAgent {
 			session,
 			rawText,
 			client,
+			{ text: userText, allowed: plainText && !userText.startsWith("/") },
 		);
+
+		if (outcome.steered) {
+			if (outcome.error) {
+				throw RequestError.internalError(undefined, outcome.error);
+			}
+			return { stopReason: "end_turn" };
+		}
 
 		// Record the steps even when the turn failed, so the next prompt does not
 		// re-read them (e.g. a stale 429 after the quota has reset).
@@ -540,6 +579,18 @@ function writeImage(data: string, mimeType: unknown): string {
 
 function escapeAttr(str: string): string {
 	return str.replace(/"/g, "&quot;");
+}
+
+function isPlainTextPrompt(prompt: unknown): boolean {
+	const blocks = Array.isArray(prompt) ? prompt : [];
+	if (blocks.length === 0) return false;
+	return blocks.every(
+		(block) =>
+			block !== null &&
+			typeof block === "object" &&
+			(block as Record<string, unknown>).type === "text" &&
+			typeof (block as Record<string, unknown>).text === "string",
+	);
 }
 
 /** Flatten an ACP prompt (text / resource / context blocks) into a string. */

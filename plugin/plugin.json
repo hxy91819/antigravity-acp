@@ -1,0 +1,4 @@
+{
+  "name": "agy-acp-steer",
+  "description": "Bridges agy-acp mid-turn steering through Antigravity lifecycle hooks."
+}

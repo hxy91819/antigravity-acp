@@ -6,6 +6,7 @@ import * as path from "node:path";
 
 // Linux MAX_ARG_STRLEN is 128KB; stay well below it to prevent E2BIG errors.
 export const MAX_PROMPT_ARG_LENGTH = 64 * 1024;
+export const STEER_PLUGIN_NAME = "agy-acp-steer";
 
 /**
  * Prepares the prompt argument for agy CLI.
@@ -104,13 +105,42 @@ export function spawnAgy(
 	binary: string,
 	args: string[],
 	cwd: string,
+	env?: Record<string, string>,
 ): Bun.Subprocess<"ignore", "ignore", "pipe"> {
 	return Bun.spawn([binary, ...args], {
 		cwd,
 		stdin: "ignore",
 		stdout: "ignore",
 		stderr: "pipe",
+		env: env ? { ...process.env, ...env } : undefined,
 	});
+}
+
+export async function detectSteerPlugin(binary: string): Promise<boolean> {
+	try {
+		const proc = Bun.spawn([binary, "plugin", "list", "--json"], {
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "ignore",
+		});
+		const text = await new Response(proc.stdout).text();
+		const exitCode = await proc.exited;
+		if (exitCode !== 0) return false;
+		const plugins = JSON.parse(text) as Array<{
+			name?: unknown;
+			enabled?: unknown;
+			hooks?: unknown;
+		}>;
+		return plugins.some(
+			(plugin) =>
+				plugin.name === STEER_PLUGIN_NAME &&
+				plugin.enabled !== false &&
+				Array.isArray(plugin.hooks) &&
+				plugin.hooks.includes(STEER_PLUGIN_NAME),
+		);
+	} catch {
+		return false;
+	}
 }
 
 /** Read $AGY_EXTRA_ARGS into a token list. */

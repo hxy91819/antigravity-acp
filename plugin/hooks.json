@@ -1,0 +1,18 @@
+{
+  "agy-acp-steer": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "bun ./steer-hook.ts pre",
+        "timeout": 10
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "bun ./steer-hook.ts post",
+        "timeout": 10
+      }
+    ]
+  }
+}

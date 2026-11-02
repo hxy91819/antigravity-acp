@@ -83,6 +83,68 @@ skipped when `AGY_SKIP_DOWNLOAD=1` or `$AGY_BIN` is set.
 | `AGY_EXTRA_ARGS` | Extra args forwarded to every `agy` invocation |
 | `AGY_CONVERSATIONS_DIR` | Custom directory where `agy` writes its conversation SQLite databases |
 
+## Mid-turn steering (native hook plugin)
+
+The server can accept a second plain-text `session/prompt` while a turn is
+already running. Instead of starting another `agy -p` process, it queues the
+text for the active run and asks the installed Antigravity hook plugin to
+inject it before the next model call. The original prompt stays pending until
+its `agy -p` child exits.
+
+Install the native Antigravity plugin from this repository:
+
+```bash
+agy plugin install "<path-to-this-repo>/plugin"
+agy plugin list --json
+```
+
+The plugin directory contains only `plugin.json`, `hooks.json`, and the Bun
+helper. It does not write or replace the user's global
+`~/.gemini/config/hooks.json`. The helper is a no-op when
+`AGY_ACP_STEER_IPC` is absent, so other `agy` sessions started by the user are
+unaffected.
+
+The server advertises `_meta.midTurnSteering: true` only when the plugin is
+installed, enabled, and the runtime can provide the local IPC endpoint. If the
+plugin is absent or disabled, clients should keep the existing interrupt
+fallback; a concurrent prompt during an active run is rejected rather than
+starting another process.
+
+Behavior and limits:
+
+- Only plain text is accepted for mid-turn steering. Slash commands and
+  resource/image blocks are rejected while a run is active.
+- Every pending steer claimed by one `PreInvocation`/`PostInvocation` is
+  injected in FIFO order. `PostInvocation` uses `force_continue` so a steer
+  arriving after the final model output is still consumed.
+- The owner-validated `conversationId` returned by the hook is the
+  authoritative conversation binding for a native steering run. It is
+  validated against the active run and session; a fresh steering run does not
+  guess its conversation DB from a directory snapshot.
+- A steer is acknowledged only after the active run's SQLite trajectory
+  contains the matching new raw user-input text. The server sends the
+  `user_message_chunk` with that raw text and the row's step index as
+  `messageId`; hook output alone is not treated as proof, and literal XML or
+  resource-link text is not passed through the normal display parser.
+- If the child exits, the run is cancelled, or no matching row appears, the
+  pending steer fails explicitly and is not retried automatically.
+- Stop/close/cancel revoke the run's queue and reject pending steers. A later
+  prompt can start a fresh run.
+- Windows currently keeps the interrupt path because the steering IPC uses a
+  Unix domain socket.
+
+To disable or remove the plugin:
+
+```bash
+agy plugin disable agy-acp-steer
+agy plugin uninstall agy-acp-steer
+```
+
+The steering path was validated with `agy` 1.4.12, a loopback fake GenAI
+gateway, and a signed-in Gemini 3.8 Flash run. The real-model check kept the
+wait tool running, inserted the correction into the same trajectory, and
+wrote the corrected result without cancellation.
+
 ## BB fork maintenance
 
 This repository is a personal fork of the third-party
