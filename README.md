@@ -126,8 +126,11 @@ Behavior and limits:
   `user_message_chunk` with that raw text and the row's step index as
   `messageId`; hook output alone is not treated as proof, and literal XML or
   resource-link text is not passed through the normal display parser.
-- If the child exits, the run is cancelled, or no matching row appears, the
-  pending steer fails explicitly and is not retried automatically.
+- After a successful child exit, steers that arrived too late for the hooks
+  continue in the same conversation, in order. If a hook claimed a steer but
+  no matching row appeared, the adapter reports the failed confirmation
+  without replaying that steer or advancing past it. Cancellation and failed
+  child exits stop queued steers.
 - Stop/close/cancel revoke the run's queue and reject pending steers. A later
   prompt can start a fresh run.
 - Windows currently keeps the interrupt path because the steering IPC uses a

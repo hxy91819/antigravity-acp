@@ -14,7 +14,7 @@ import { StreamPoller } from "../conversation/streaming";
 import type { StepRow } from "../types";
 import type { Session } from "../types/session";
 import type { AcpClient } from "./client";
-import { SteerIpc, SteerQueue } from "./steering";
+import { type SteerEntry, SteerIpc, SteerQueue } from "./steering";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -67,15 +67,15 @@ export interface AdapterConfig {
 	skipNarration: boolean;
 }
 
+type AgyOutcome = PromptOutcome & { canContinue: boolean };
+
 interface ActiveRun {
 	sessionId: string;
-	owner: string;
 	queue: SteerQueue;
 	ipc: SteerIpc | null;
 	accepting: boolean;
 	closed: boolean;
 	cancelled: boolean;
-	hookBinding: boolean;
 	conversationId: string | null;
 	lastStepIdx: number;
 	seenUserPromptIdxs: Set<number>;
@@ -139,6 +139,73 @@ export class Adapter {
 			);
 
 		this.cancelled.delete(sessionId);
+		const run: ActiveRun = {
+			sessionId,
+			queue: new SteerQueue(),
+			ipc: null,
+			accepting: true,
+			closed: false,
+			cancelled: false,
+			conversationId: session.conversationId,
+			lastStepIdx: session.lastStepIdx,
+			seenUserPromptIdxs: new Set(),
+		};
+		this.active.set(sessionId, run);
+
+		let continuing: SteerEntry | undefined;
+		try {
+			let outcome = await this.runAgy(run, session, promptText, client);
+			while (outcome.canContinue && !run.cancelled && outcome.conversationId) {
+				continuing = run.queue.takeUnclaimed();
+				if (!continuing) break;
+				const next = await this.runAgy(
+					run,
+					{
+						...session,
+						conversationId: outcome.conversationId,
+						lastStepIdx: outcome.lastStepIdx,
+					},
+					continuing.text,
+					continuing.client,
+				);
+				if (next.canContinue && !run.cancelled) continuing.resolve();
+				else
+					continuing.reject(
+						new Error(
+							next.error ??
+								(run.cancelled
+									? "agy steer cancelled"
+									: "agy steer follow-up failed"),
+						),
+					);
+				continuing = undefined;
+				outcome = {
+					...next,
+					hadUpdates: outcome.hadUpdates || next.hadUpdates,
+				};
+			}
+			return outcome;
+		} finally {
+			run.accepting = false;
+			run.closed = true;
+			const error = new Error(
+				run.cancelled
+					? "agy steer cancelled"
+					: "agy turn ended before steer insertion was confirmed",
+			);
+			continuing?.reject(error);
+			run.queue.failAll(error);
+			this.active.delete(sessionId);
+		}
+	}
+
+	private async runAgy(
+		run: ActiveRun,
+		session: Session,
+		promptText: string,
+		client: AcpClient,
+	): Promise<AgyOutcome> {
+		const { sessionId } = run;
 
 		// Use the session's cwd if set, otherwise fall back to the server's workingDir.
 		const effectiveCwd = session.cwd || this.config.workingDir;
@@ -160,21 +227,6 @@ export class Adapter {
 			extraArgs: extraArgsFromEnv(),
 		});
 
-		const run: ActiveRun = {
-			sessionId,
-			owner: randomUUID(),
-			queue: new SteerQueue(),
-			ipc: null,
-			accepting: true,
-			closed: false,
-			cancelled: false,
-			hookBinding: false,
-			conversationId: session.conversationId,
-			lastStepIdx: session.lastStepIdx,
-			seenUserPromptIdxs: new Set(),
-		};
-		this.active.set(sessionId, run);
-
 		let poller: StreamPoller | null = null;
 		const bindHookConversation = (id: string): boolean => {
 			if (
@@ -188,10 +240,10 @@ export class Adapter {
 			return true;
 		};
 
+		const owner = randomUUID();
 		if (this.steerAvailable && process.platform !== "win32") {
 			try {
-				run.ipc = new SteerIpc(run.owner, run.queue, bindHookConversation);
-				run.hookBinding = true;
+				run.ipc = new SteerIpc(owner, run.queue, bindHookConversation);
 			} catch (error) {
 				run.accepting = false;
 				console.error(
@@ -202,25 +254,24 @@ export class Adapter {
 			run.accepting = false;
 		}
 
+		const ipc = run.ipc;
 		let child: Bun.Subprocess;
 		try {
 			child = spawnAgy(
 				this.config.binary,
 				args,
 				effectiveCwd,
-				run.ipc
+				ipc
 					? {
-							AGY_ACP_STEER_IPC: run.ipc.socketPath,
-							AGY_ACP_STEER_OWNER: run.owner,
+							AGY_ACP_STEER_IPC: ipc.socketPath,
+							AGY_ACP_STEER_OWNER: owner,
 						}
 					: undefined,
 			);
 		} catch (err) {
 			run.accepting = false;
-			run.closed = true;
-			run.queue.failAll(new Error("agy failed to start"));
 			run.ipc?.close();
-			this.active.delete(sessionId);
+			run.ipc = null;
 			if (tempFilePath) {
 				try {
 					if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
@@ -231,6 +282,7 @@ export class Adapter {
 				conversationId: session.conversationId,
 				lastStepIdx: session.lastStepIdx,
 				hadUpdates: false,
+				canContinue: false,
 				error: `failed to run agy: ${(err as Error).message}`,
 			};
 		}
@@ -248,7 +300,7 @@ export class Adapter {
 				baseStepIdx: session.lastStepIdx,
 				skipNarration: this.config.skipNarration,
 				cwd: effectiveCwd,
-				snapshot: run.hookBinding ? null : snapshot,
+				snapshot: ipc ? null : snapshot,
 			});
 			poller = activePoller;
 
@@ -257,7 +309,7 @@ export class Adapter {
 				for (const update of activePoller.poll()) {
 					await client.update(sessionId, update);
 				}
-				if (!run.hookBinding) {
+				if (!ipc) {
 					run.conversationId =
 						activePoller.conversationId ?? run.conversationId;
 				}
@@ -293,7 +345,9 @@ export class Adapter {
 			})();
 
 			const exitCode = await child.exited;
-			run.accepting = false;
+			ipc?.close();
+			run.ipc = null;
+			if (exitCode !== 0) run.accepting = false;
 			polling = false;
 			await loop;
 
@@ -314,15 +368,9 @@ export class Adapter {
 			if (stderr.length > 0) console.error(`[agy-acp] agy stderr: ${stderr}`);
 
 			const wasCancelled = run.cancelled || this.cancelled.delete(sessionId);
-			run.queue.failAll(
-				new Error(
-					wasCancelled
-						? "agy steer cancelled"
-						: "agy turn ended before steer insertion was confirmed",
-				),
-			);
 
-			const outcome: PromptOutcome = {
+			const outcome: AgyOutcome = {
+				canContinue: exitCode === 0 && !wasCancelled && !quotaError,
 				stopReason: wasCancelled ? "cancelled" : "end_turn",
 				conversationId: poller.conversationId,
 				lastStepIdx: poller.lastStepIdx,
@@ -343,16 +391,10 @@ export class Adapter {
 
 			return outcome;
 		} finally {
-			run.accepting = false;
-			run.closed = true;
-			run.queue.failAll(new Error("agy steer run closed"));
 			run.ipc?.close();
 			run.ipc = null;
 			if (this.children.get(sessionId) === child) {
 				this.children.delete(sessionId);
-			}
-			if (this.active.get(sessionId) === run) {
-				this.active.delete(sessionId);
 			}
 			if (tempFilePath) {
 				try {

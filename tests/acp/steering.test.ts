@@ -393,6 +393,59 @@ describe("Adapter mid-turn steering", () => {
 		await fresh;
 	});
 
+	test("continues the same conversation with a steer received after the final hook", async () => {
+		const dir = tempSetup();
+		createConversation(dir, "c1");
+		const calls = fakeAgy();
+		const adapter = new Adapter({
+			workingDir: dir,
+			binary: "agy",
+			conversationsDir: dir,
+			skipNarration: false,
+		});
+		adapter.setSteerAvailable(true);
+		const session = newSession(dir);
+		const first = adapter.runPrompt("s1", session, "FIRST", clientFor([]));
+		const { AGY_ACP_STEER_IPC: socket, AGY_ACP_STEER_OWNER: owner } =
+			calls[0]!.opts.env;
+		appendUser(dir, "c1", 0, "FIRST");
+		await claim(socket, "c1", 1, owner);
+
+		const steer = adapter.runPrompt("s1", session, "LATE", clientFor([]));
+		expect(calls).toHaveLength(1);
+		calls[0]!.child.finish();
+
+		try {
+			const firstSettled = first.then(
+				async () => (await steer).error ?? "original prompt settled",
+			);
+			const resumed = waitFor(() => calls.length === 2, 1500).then(
+				() => "follow-up started",
+			);
+			const result = await Promise.race([
+				firstSettled,
+				resumed,
+				steer.then((outcome) => outcome.error),
+			]);
+			expect(result).toBe("follow-up started");
+			expect(calls[1]!.args).toContain("--conversation");
+			expect(calls[1]!.args).toContain("c1");
+			expect(calls[1]!.args.slice(-2)).toEqual(["-p", "LATE"]);
+			appendUser(dir, "c1", 3, "LATE");
+			calls[1]!.child.finish();
+			expect((await steer).error).toBeUndefined();
+			expect(await first).toMatchObject({
+				conversationId: "c1",
+				lastStepIdx: 3,
+				stopReason: "end_turn",
+			});
+			expect(calls).toHaveLength(2);
+		} finally {
+			adapter.cancel("s1");
+			await Promise.allSettled([first, steer]);
+		}
+	});
+
 	test("fails claimed steers when the child exits without a matching row", async () => {
 		const dir = tempSetup();
 		createConversation(dir, "c1");
@@ -412,9 +465,12 @@ describe("Adapter mid-turn steering", () => {
 		const socketPath = calls[0]!.opts.env.AGY_ACP_STEER_IPC as string;
 		const steer = adapter.runPrompt("s1", session, "STEER_ONE", clientFor([]));
 		await claim(socketPath, "c1", 1, owner);
+		const later = adapter.runPrompt("s1", session, "STEER_TWO", clientFor([]));
 		calls[0]!.child.finish();
-		const steerOutcome = await steer;
+		const [steerOutcome, laterOutcome] = await Promise.all([steer, later]);
 		expect(steerOutcome.error).toContain("turn ended");
+		expect(laterOutcome.error).toContain("turn ended");
+		expect(calls).toHaveLength(1);
 		const firstOutcome = await first;
 		expect(firstOutcome.stopReason).toBe("end_turn");
 		expect(adapter.hasActiveRun("s1")).toBe(false);

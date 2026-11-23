@@ -57,6 +57,11 @@ export class SteerQueue {
 		return batch;
 	}
 
+	takeUnclaimed(): SteerEntry | undefined {
+		if (this.closed || this.claimed.length > 0) return undefined;
+		return this.pending.shift();
+	}
+
 	take(row: StepRow): SteerMatch | null {
 		const text = rawUserPromptText(row);
 		if (text === null) return null;
@@ -134,6 +139,7 @@ export class SteerIpc {
 				) {
 					return new Response("invalid initial step", { status: 400 });
 				}
+				if (this.closed) return new Response("stale owner", { status: 409 });
 				let bound = false;
 				try {
 					bound = this.onConversation(payload.conversationId);
