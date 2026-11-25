@@ -106,15 +106,15 @@ process open for a native timer.
 
 The server advertises `_meta.midTurnSteering: true` only when the plugin is
 installed, enabled, and the runtime can provide the local IPC endpoint. If the
-plugin is absent or disabled, clients should keep the existing interrupt
-fallback; a concurrent prompt during an active run is rejected rather than
-starting another process.
+plugin is absent or disabled, clients should queue follow-ups until the
+active prompt finishes.
 
 Behavior and limits:
 
-- Only plain text is accepted for mid-turn steering. For slash commands,
-  resources, and images, the adapter asks BB to interrupt the active run and
-  resend the complete input as a regular prompt.
+- Mid-turn steering supports text, images, resource links, and embedded text.
+  The adapter writes each image to a private local file and includes its path
+  and a `view_file` instruction in the same message. Slash commands require a
+  separate prompt after the active prompt finishes.
 - Every pending steer claimed by one `PreInvocation`/`PostInvocation` is
   injected in FIFO order. `PostInvocation` uses `force_continue` so a steer
   arriving after the final model output is still consumed.
@@ -134,8 +134,8 @@ Behavior and limits:
   child exits stop queued steers.
 - Stop/close/cancel revoke the run's queue and reject pending steers. A later
   prompt can start a fresh run.
-- Windows currently keeps the interrupt path because the steering IPC uses a
-  Unix domain socket.
+- Windows clients queue follow-ups because the steering IPC requires a Unix
+  domain socket.
 
 To disable or remove the plugin:
 

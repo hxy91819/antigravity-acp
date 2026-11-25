@@ -127,16 +127,9 @@ export class Adapter {
 		session: Session,
 		promptText: string,
 		client: AcpClient,
-		steer?: { text: string; allowed: boolean },
 	): Promise<PromptOutcome> {
 		const current = this.active.get(sessionId);
-		if (current)
-			return this.steer(
-				current,
-				steer?.text ?? promptText,
-				client,
-				steer?.allowed ?? true,
-			);
+		if (current) return this.steer(current, promptText, client);
 
 		this.cancelled.delete(sessionId);
 		const run: ActiveRun = {
@@ -408,7 +401,6 @@ export class Adapter {
 		run: ActiveRun,
 		promptText: string,
 		client: AcpClient,
-		allowed: boolean,
 	): Promise<PromptOutcome> {
 		const fail = (error: string): PromptOutcome => ({
 			stopReason: "end_turn",
@@ -420,9 +412,6 @@ export class Adapter {
 		});
 		if (!this.steerAvailable || !run.accepting || run.closed) {
 			return fail("agy turn is not accepting mid-turn steering");
-		}
-		if (!allowed) {
-			return fail("agy mid-turn steering supports plain text only");
 		}
 		if (promptText.trim().length === 0) {
 			return fail("agy mid-turn steering requires non-empty text");

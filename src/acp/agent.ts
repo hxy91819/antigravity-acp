@@ -323,12 +323,11 @@ export class AgyAcpAgent {
 
 		const active = this.adapter.hasActiveRun(sessionId);
 		const userText = rawPromptText(params.prompt).trim();
-		const plainText = isPlainTextPrompt(params.prompt);
 		if (active) {
-			if (!plainText) {
+			if (!isSteerablePrompt(params.prompt)) {
 				throw RequestError.invalidParams(
 					undefined,
-					"Prompt already in flight. Attachments require a separate prompt.",
+					"Prompt already in flight. This content requires a separate prompt.",
 				);
 			}
 			if (userText.startsWith("/")) {
@@ -338,7 +337,10 @@ export class AgyAcpAgent {
 				);
 			}
 		}
-		const rawText = active ? userText : promptText(params.prompt);
+		const rawText =
+			active && isPlainTextPrompt(params.prompt)
+				? userText
+				: promptText(params.prompt);
 		if (!active && (userText === "/usage" || userText.startsWith("/usage "))) {
 			const output = await runNonInteractivePrompt(
 				this.config.binary,
@@ -360,7 +362,6 @@ export class AgyAcpAgent {
 			session,
 			rawText,
 			client,
-			{ text: userText, allowed: plainText && !userText.startsWith("/") },
 		);
 
 		if (outcome.steered) {
@@ -582,14 +583,47 @@ function escapeAttr(str: string): string {
 }
 
 function isPlainTextPrompt(prompt: unknown): boolean {
-	const blocks = Array.isArray(prompt) ? prompt : [];
-	if (blocks.length === 0) return false;
-	return blocks.every(
-		(block) =>
-			block !== null &&
-			typeof block === "object" &&
-			(block as Record<string, unknown>).type === "text" &&
-			typeof (block as Record<string, unknown>).text === "string",
+	return (
+		Array.isArray(prompt) && prompt.every((block) => block?.type === "text")
+	);
+}
+
+function isSteerablePrompt(prompt: unknown): boolean {
+	return (
+		Array.isArray(prompt) &&
+		prompt.length > 0 &&
+		prompt.every((block: unknown) => {
+			if (!block || typeof block !== "object" || !("type" in block))
+				return false;
+			switch (block.type) {
+				case "text":
+					return "text" in block && typeof block.text === "string";
+				case "image":
+					return (
+						"data" in block &&
+						typeof block.data === "string" &&
+						block.data.length > 0
+					);
+				case "resource_link":
+					return (
+						"uri" in block &&
+						typeof block.uri === "string" &&
+						block.uri.length > 0
+					);
+				case "resource": {
+					if (
+						!("resource" in block) ||
+						!block.resource ||
+						typeof block.resource !== "object"
+					)
+						return false;
+					const resource = block.resource as Json;
+					return stringField(resource, "text", "content").length > 0;
+				}
+				default:
+					return false;
+			}
+		})
 	);
 }
 
