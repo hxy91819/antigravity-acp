@@ -112,8 +112,9 @@ starting another process.
 
 Behavior and limits:
 
-- Only plain text is accepted for mid-turn steering. Slash commands and
-  resource/image blocks are rejected while a run is active.
+- Only plain text is accepted for mid-turn steering. For slash commands,
+  resources, and images, the adapter asks BB to interrupt the active run and
+  resend the complete input as a regular prompt.
 - Every pending steer claimed by one `PreInvocation`/`PostInvocation` is
   injected in FIFO order. `PostInvocation` uses `force_continue` so a steer
   arriving after the final model output is still consumed.

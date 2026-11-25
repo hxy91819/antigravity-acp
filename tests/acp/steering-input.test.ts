@@ -41,35 +41,25 @@ describe("mid-turn prompt validation", () => {
 		mock.restore();
 	});
 
-	test("rejects non-text input during an active run", async () => {
+	test.each([
+		{
+			type: "image",
+			data: "iVBORw0KGgo=",
+			mimeType: "image/png",
+		},
+		{
+			type: "resource_link",
+			uri: "file:///example.txt",
+			name: "Example",
+		},
+		{ type: "text", text: "/usage" },
+	])("requests interrupt delivery for an unsupported active prompt", async (block) => {
 		await expect(
-			agent.prompt(
-				{
-					sessionId: "s1",
-					prompt: [
-						{
-							type: "resource_link",
-							uri: "https://example.com",
-							title: "Example",
-						},
-					],
-				} as any,
-				client,
-			),
-		).rejects.toThrow("plain text only");
-		expect(runPrompt).not.toHaveBeenCalled();
-	});
-
-	test("rejects slash commands during an active run", async () => {
-		await expect(
-			agent.prompt(
-				{
-					sessionId: "s1",
-					prompt: [{ type: "text", text: "/usage" }],
-				} as any,
-				client,
-			),
-		).rejects.toThrow("slash commands");
+			agent.prompt({ sessionId: "s1", prompt: [block] }, client),
+		).rejects.toMatchObject({
+			code: -32602,
+			message: expect.stringMatching(/already in flight/i),
+		});
 		expect(runPrompt).not.toHaveBeenCalled();
 	});
 });

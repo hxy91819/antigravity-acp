@@ -328,13 +328,13 @@ export class AgyAcpAgent {
 			if (!plainText) {
 				throw RequestError.invalidParams(
 					undefined,
-					"mid-turn steering supports plain text only",
+					"Prompt already in flight. Attachments require a separate prompt.",
 				);
 			}
 			if (userText.startsWith("/")) {
 				throw RequestError.invalidParams(
 					undefined,
-					"mid-turn steering does not accept slash commands",
+					"Prompt already in flight. Slash commands require a separate prompt.",
 				);
 			}
 		}
