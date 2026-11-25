@@ -58,7 +58,10 @@ export interface PromptOutcome {
 	/** Set when agy failed to start, hit a usage limit, or exited non-zero with nothing streamed. */
 	error?: string;
 	steered?: boolean;
+	steerInserted?: boolean;
 }
+
+class SteerUpdateError extends Error {}
 
 export interface AdapterConfig {
 	binary: string;
@@ -426,7 +429,10 @@ export class Adapter {
 				steered: true,
 			};
 		} catch (error) {
-			return fail((error as Error).message);
+			const message = error instanceof Error ? error.message : String(error);
+			return error instanceof SteerUpdateError
+				? { ...fail(message), steerInserted: true }
+				: fail(message);
 		}
 	}
 
@@ -445,7 +451,11 @@ export class Adapter {
 			await match.entry.client.update(run.sessionId, update);
 			match.entry.resolve();
 		} catch (error) {
-			match.entry.reject(error as Error);
+			match.entry.reject(
+				new SteerUpdateError(
+					error instanceof Error ? error.message : String(error),
+				),
+			);
 		}
 	}
 }

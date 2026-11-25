@@ -40,7 +40,7 @@ import {
 import { ReplayCache } from "../conversation/replay";
 import { SessionStore } from "../store/sessionStore";
 import { newSession, type Session } from "../types/session";
-import { Adapter } from "./adapter";
+import { Adapter, type PromptOutcome } from "./adapter";
 import type { AcpClient } from "./client";
 import { SessionManager } from "./sessions";
 
@@ -337,10 +337,6 @@ export class AgyAcpAgent {
 				);
 			}
 		}
-		const rawText =
-			active && isPlainTextPrompt(params.prompt)
-				? userText
-				: promptText(params.prompt);
 		if (!active && (userText === "/usage" || userText.startsWith("/usage "))) {
 			const output = await runNonInteractivePrompt(
 				this.config.binary,
@@ -357,12 +353,36 @@ export class AgyAcpAgent {
 			return { stopReason: "end_turn" };
 		}
 
-		const outcome = await this.adapter.runPrompt(
-			sessionId,
-			session,
-			rawText,
-			client,
-		);
+		const imagePaths: string[] = [];
+		let outcome: PromptOutcome | undefined;
+		try {
+			const rawText =
+				active && isPlainTextPrompt(params.prompt)
+					? userText
+					: promptText(params.prompt, imagePaths);
+			outcome = await this.adapter.runPrompt(
+				sessionId,
+				session,
+				rawText,
+				client,
+			);
+		} finally {
+			if (
+				outcome === undefined ||
+				(active && outcome.error && !outcome.steerInserted)
+			) {
+				for (const imagePath of imagePaths) {
+					try {
+						fs.rmSync(imagePath, { force: true });
+					} catch (error) {
+						console.warn(
+							"[agy-acp] Could not remove an unused image attachment",
+							error,
+						);
+					}
+				}
+			}
+		}
 
 		if (outcome.steered) {
 			if (outcome.error) {
@@ -564,17 +584,24 @@ export class AgyAcpAgent {
 /** Write a base64 image to a new temp file readable only by the current user.
  *  The extension comes from the client's mimeType, so only plain alphanumerics
  *  are accepted; anything else could escape the temp dir or alter the prompt. */
-function writeImage(data: string, mimeType: unknown): string {
+function writeImage(
+	data: string,
+	mimeType: unknown,
+	imagePaths: string[],
+): string {
 	const subtype = typeof mimeType === "string" ? mimeType.split("/")[1] : "";
 	const ext = subtype && /^[a-z0-9]{1,10}$/i.test(subtype) ? subtype : "png";
 	const tmpPath = path.join(
 		os.tmpdir(),
 		`agy_acp_img_${crypto.randomUUID()}.${ext}`,
 	);
-	fs.writeFileSync(tmpPath, Buffer.from(data, "base64"), {
-		mode: 0o600,
-		flag: "wx",
-	});
+	const fd = fs.openSync(tmpPath, "wx", 0o600);
+	imagePaths.push(tmpPath);
+	try {
+		fs.writeFileSync(fd, Buffer.from(data, "base64"));
+	} finally {
+		fs.closeSync(fd);
+	}
 	return tmpPath;
 }
 
@@ -628,7 +655,7 @@ function isSteerablePrompt(prompt: unknown): boolean {
 }
 
 /** Flatten an ACP prompt (text / resource / context blocks) into a string. */
-function promptText(prompt: unknown): string {
+function promptText(prompt: unknown, imagePaths: string[]): string {
 	const blocks = Array.isArray(prompt) ? prompt : [];
 	const parts: string[] = [];
 	for (const block of blocks) {
@@ -668,7 +695,7 @@ function promptText(prompt: unknown): string {
 			// Image — agy only takes text, so write the image to a private temp
 			// file and point the model at it.
 			parts.push(
-				`\n[User attached an image file. Absolute path: ${writeImage(obj.data, obj.mimeType)}. You must use your view_file tool on this path to see it.]\n`,
+				`\n[User attached an image file. Absolute path: ${writeImage(obj.data, obj.mimeType, imagePaths)}. You must use your view_file tool on this path to see it.]\n`,
 			);
 		} else if (typeof obj.text === "string") {
 			// Fallback: treat any block with a text field as plain text.

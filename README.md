@@ -115,6 +115,9 @@ Behavior and limits:
   The adapter writes each image to a private local file and includes its path
   and a `view_file` instruction in the same message. Slash commands require a
   separate prompt after the active prompt finishes.
+  If the steer fails before insertion is confirmed, the adapter removes its
+  temporary image copies. Confirmed images follow the same host temp-file
+  lifetime as ordinary prompt attachments.
 - Every pending steer claimed by one `PreInvocation`/`PostInvocation` is
   injected in FIFO order. `PostInvocation` uses `force_continue` so a steer
   arriving after the final model output is still consumed.

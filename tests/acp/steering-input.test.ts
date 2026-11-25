@@ -8,7 +8,7 @@ import {
 	spyOn,
 	test,
 } from "bun:test";
-import { readFileSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { Adapter } from "../../src/acp/adapter";
 import { AgyAcpAgent } from "../../src/acp/agent";
 import { SessionManager } from "../../src/acp/sessions";
@@ -78,6 +78,34 @@ describe("mid-turn prompt validation", () => {
 			expect(text).toContain("Keep these notes.");
 		} finally {
 			unlinkSync(imagePath);
+		}
+	});
+
+	test("removes the staged image if the active run rejects the steer", async () => {
+		runPrompt.mockResolvedValueOnce({
+			steered: true,
+			error: "agy turn ended before steer insertion was confirmed",
+		});
+		await expect(
+			agent.prompt(
+				{
+					sessionId: "s1",
+					prompt: [
+						{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+					],
+				},
+				client,
+			),
+		).rejects.toMatchObject({ code: -32603 });
+
+		const text = runPrompt.mock.calls[0]?.[2];
+		const imagePath =
+			/Absolute path: (.+?)[.] You must use your view_file/.exec(text)?.[1];
+		expect(imagePath).toBeDefined();
+		try {
+			expect(existsSync(imagePath)).toBe(false);
+		} finally {
+			if (existsSync(imagePath)) unlinkSync(imagePath);
 		}
 	});
 
