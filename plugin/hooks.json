@@ -13,6 +13,18 @@
         "command": "bun ./steer-hook.ts post",
         "timeout": 10
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^schedule$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun ./schedule-hook.ts",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

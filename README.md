@@ -98,11 +98,11 @@ agy plugin install "<path-to-this-repo>/plugin"
 agy plugin list --json
 ```
 
-The plugin directory contains only `plugin.json`, `hooks.json`, and the Bun
-helper. It does not write or replace the user's global
-`~/.gemini/config/hooks.json`. The helper is a no-op when
-`AGY_ACP_STEER_IPC` is absent, so other `agy` sessions started by the user are
-unaffected.
+The plugin keeps its hook definitions and Bun helpers in its own directory.
+The steering helper only acts when `AGY_ACP_STEER_IPC` is set. When the
+launcher sets `AGY_ACP_USE_BB_AUTOMATIONS=1`, the `schedule` tool directs
+scheduled follow-ups to BB agent automation instead of keeping the print
+process open for a native timer.
 
 The server advertises `_meta.midTurnSteering: true` only when the plugin is
 installed, enabled, and the runtime can provide the local IPC endpoint. If the
