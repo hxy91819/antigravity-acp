@@ -393,7 +393,9 @@ describe("Adapter mid-turn steering", () => {
 		await fresh;
 	});
 
-	test("continues the same conversation with a steer received after the final hook", async () => {
+	test.each([
+		0, 7,
+	])("continues the same conversation with a late steer (exit %d)", async (exitCode) => {
 		const dir = tempSetup();
 		createConversation(dir, "c1");
 		const calls = fakeAgy();
@@ -432,8 +434,14 @@ describe("Adapter mid-turn steering", () => {
 			expect(calls[1]!.args).toContain("c1");
 			expect(calls[1]!.args.slice(-2)).toEqual(["-p", "LATE"]);
 			appendUser(dir, "c1", 3, "LATE");
-			calls[1]!.child.finish();
-			expect((await steer).error).toBeUndefined();
+			calls[1]!.child.finish(exitCode);
+			const outcome = await steer;
+			if (exitCode === 0) expect(outcome.error).toBeUndefined();
+			else
+				expect(outcome).toMatchObject({
+					error: expect.stringContaining("agy"),
+					steerSubmitted: true,
+				});
 			expect(await first).toMatchObject({
 				conversationId: "c1",
 				lastStepIdx: 3,

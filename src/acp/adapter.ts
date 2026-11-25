@@ -58,10 +58,10 @@ export interface PromptOutcome {
 	/** Set when agy failed to start, hit a usage limit, or exited non-zero with nothing streamed. */
 	error?: string;
 	steered?: boolean;
-	steerInserted?: boolean;
+	steerSubmitted?: boolean;
 }
 
-class SteerUpdateError extends Error {}
+class SubmittedSteerError extends Error {}
 
 export interface AdapterConfig {
 	binary: string;
@@ -149,11 +149,13 @@ export class Adapter {
 		this.active.set(sessionId, run);
 
 		let continuing: SteerEntry | undefined;
+		let continuingSubmitted = false;
 		try {
 			let outcome = await this.runAgy(run, session, promptText, client);
 			while (outcome.canContinue && !run.cancelled && outcome.conversationId) {
 				continuing = run.queue.takeUnclaimed();
 				if (!continuing) break;
+				continuingSubmitted = false;
 				const next = await this.runAgy(
 					run,
 					{
@@ -163,17 +165,22 @@ export class Adapter {
 					},
 					continuing.text,
 					continuing.client,
+					() => {
+						continuingSubmitted = true;
+					},
 				);
 				if (next.canContinue && !run.cancelled) continuing.resolve();
-				else
+				else {
+					const SteerError = continuingSubmitted ? SubmittedSteerError : Error;
 					continuing.reject(
-						new Error(
+						new SteerError(
 							next.error ??
 								(run.cancelled
 									? "agy steer cancelled"
 									: "agy steer follow-up failed"),
 						),
 					);
+				}
 				continuing = undefined;
 				outcome = {
 					...next,
@@ -189,7 +196,9 @@ export class Adapter {
 					? "agy steer cancelled"
 					: "agy turn ended before steer insertion was confirmed",
 			);
-			continuing?.reject(error);
+			continuing?.reject(
+				continuingSubmitted ? new SubmittedSteerError(error.message) : error,
+			);
 			run.queue.failAll(error);
 			this.active.delete(sessionId);
 		}
@@ -200,6 +209,7 @@ export class Adapter {
 		session: Session,
 		promptText: string,
 		client: AcpClient,
+		onSubmitted?: () => void,
 	): Promise<AgyOutcome> {
 		const { sessionId } = run;
 
@@ -283,6 +293,7 @@ export class Adapter {
 			};
 		}
 		this.children.set(sessionId, child);
+		onSubmitted?.();
 
 		try {
 			// Drain stderr concurrently (resolves when the process exits).
@@ -430,8 +441,8 @@ export class Adapter {
 			};
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			return error instanceof SteerUpdateError
-				? { ...fail(message), steerInserted: true }
+			return error instanceof SubmittedSteerError
+				? { ...fail(message), steerSubmitted: true }
 				: fail(message);
 		}
 	}
@@ -452,7 +463,7 @@ export class Adapter {
 			match.entry.resolve();
 		} catch (error) {
 			match.entry.reject(
-				new SteerUpdateError(
+				new SubmittedSteerError(
 					error instanceof Error ? error.message : String(error),
 				),
 			);

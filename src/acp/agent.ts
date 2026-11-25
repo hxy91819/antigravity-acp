@@ -369,7 +369,7 @@ export class AgyAcpAgent {
 		} finally {
 			if (
 				outcome === undefined ||
-				(active && outcome.error && !outcome.steerInserted)
+				(active && outcome.error && !outcome.steerSubmitted)
 			) {
 				for (const imagePath of imagePaths) {
 					try {
