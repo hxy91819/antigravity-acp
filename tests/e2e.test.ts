@@ -1,11 +1,16 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { client, methods, ndJsonStream } from "@agentclientprotocol/sdk";
 
 describe("ACP Server E2E", () => {
 	let proc: ReturnType<typeof Bun.spawn>;
 	let connection: any;
+	let stateDir: string;
 
 	beforeAll(async () => {
+		stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-e2e-state-"));
 		proc = Bun.spawn(["bun", "run", "index.ts"], {
 			stdin: "pipe",
 			stdout: "pipe",
@@ -13,6 +18,7 @@ describe("ACP Server E2E", () => {
 			env: {
 				...process.env,
 				AGY_SKIP_DOWNLOAD: "1", // to speed it up and avoid downloading if it tries to
+				AGY_ACP_STATE_DIR: stateDir,
 			},
 		});
 
@@ -37,6 +43,9 @@ describe("ACP Server E2E", () => {
 		}
 		if (proc) {
 			proc.kill();
+		}
+		if (stateDir) {
+			fs.rmSync(stateDir, { recursive: true, force: true });
 		}
 	});
 

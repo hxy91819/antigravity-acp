@@ -54,7 +54,11 @@ export async function discoverModels(binary: string): Promise<DiscoveredModel[]>
 				const value = parts[0] ?? "";
 				const name = parts.length > 1 ? parts.slice(1).join(" ") : value;
 				return { value, name };
-			});
+			})
+			.filter(
+				(model) =>
+					model.value.length > 0 && /^[a-z0-9][a-z0-9._-]+$/i.test(model.value),
+			);
 	} catch {
 		return [];
 	}

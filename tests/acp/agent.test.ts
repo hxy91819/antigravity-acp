@@ -21,21 +21,25 @@ const _PLAN_MODE_ID = "plan";
 describe("AgyAcpAgent", () => {
 	let agent: AgyAcpAgent;
 	let clientMock: any;
+	let stateDir: string;
 
 	beforeEach(() => {
+		stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-agent-test-state-"));
 		clientMock = { update: mock(async () => {}) };
 
 		// Mock SessionManager
 		spyOn(SessionManager.prototype, "create").mockReturnValue({
 			sessionId: "s1",
-			session: { cwd: process.cwd() },
+			session: { cwd: process.cwd(), modelId: null },
 		} as any);
 		spyOn(SessionManager.prototype, "ensure").mockResolvedValue({
 			cwd: process.cwd(),
+			modelId: "gemini-4-neon-high",
 		} as any);
 		spyOn(SessionManager.prototype, "peek").mockReturnValue({
 			cwd: process.cwd(),
 			conversationId: "c1",
+			modelId: "gemini-4-neon-high",
 		} as any);
 		spyOn(SessionManager.prototype, "list").mockResolvedValue([
 			{ sessionId: "s1", session: { cwd: process.cwd() } },
@@ -58,11 +62,13 @@ describe("AgyAcpAgent", () => {
 		agent = new AgyAcpAgent({
 			workingDir: process.cwd(),
 			skipNarration: false,
+			stateDir,
 		} as any);
 	});
 
 	afterEach(() => {
 		mock.restore();
+		fs.rmSync(stateDir, { recursive: true, force: true });
 	});
 
 	test("initialize returns capabilities", async () => {
@@ -176,6 +182,7 @@ describe("AgyAcpAgent", () => {
 		spyOn(SessionManager.prototype, "ensure").mockResolvedValue({
 			cwd: process.cwd(),
 			permissionMode: "plan",
+			modelId: "gemini-4-neon-high",
 		} as any);
 
 		await agent.prompt(
@@ -194,6 +201,7 @@ describe("AgyAcpAgent", () => {
 			cwd: process.cwd(),
 			conversationId: "c1",
 			lastStepIdx: 3,
+			modelId: "gemini-4-neon-high",
 		};
 		spyOn(SessionManager.prototype, "ensure").mockResolvedValue(session as any);
 		spyOn(Adapter.prototype, "runPrompt").mockResolvedValue({
@@ -291,6 +299,194 @@ describe("AgyAcpAgent", () => {
 			}
 		} finally {
 			fs.rmSync(imagePath, { force: true });
+		}
+	});
+
+	test("newSession binds session.modelId to the advertised default model and passes it to runPrompt", async () => {
+		const isolated = fs.mkdtempSync(
+			path.join(os.tmpdir(), "agy-default-model-"),
+		);
+		try {
+			fs.writeFileSync(
+				path.join(isolated, "models.json"),
+				JSON.stringify([
+					{ value: "gemini-4-neon-high", name: "Gemini 4 Neon (High)" },
+					{ value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
+				]),
+			);
+			const createdSession: any = {
+				cwd: isolated,
+				conversationId: null,
+				lastStepIdx: -1,
+				modelId: null,
+				permissionMode: null,
+				additionalDirs: [],
+			};
+			spyOn(SessionManager.prototype, "create").mockReturnValue({
+				sessionId: "s-bound",
+				session: createdSession,
+			});
+			spyOn(SessionManager.prototype, "ensure").mockResolvedValue(
+				createdSession,
+			);
+			const runPromptSpy = spyOn(
+				Adapter.prototype,
+				"runPrompt",
+			).mockResolvedValue({
+				stopReason: "end_turn",
+				error: undefined,
+				conversationId: "c-bound",
+				lastStepIdx: 1,
+				hadUpdates: true,
+			});
+
+			const isolatedAgent = new AgyAcpAgent({
+				binary: "/nonexistent-agy",
+				conversationsDir: path.join(isolated, "conversations"),
+				workingDir: isolated,
+				skipNarration: false,
+				version: "test",
+				stateDir: isolated,
+			});
+
+			const res = isolatedAgent.newSession({ cwd: isolated }, clientMock);
+			const modelOpt = res.configOptions?.find((opt) => opt.id === "model");
+			expect(modelOpt?.currentValue).toBe("gemini-4-neon-high");
+			expect(createdSession.modelId).toBe("gemini-4-neon-high");
+
+			await isolatedAgent.prompt(
+				{ sessionId: "s-bound", prompt: [{ type: "text", text: "hi" }] },
+				clientMock,
+			);
+			expect(runPromptSpy.mock.calls[0]?.[1]?.modelId).toBe(
+				"gemini-4-neon-high",
+			);
+		} finally {
+			fs.rmSync(isolated, { recursive: true, force: true });
+		}
+	});
+
+	test("prompt fails fast when no model is selected and discovery returns no models", async () => {
+		const session: any = {
+			cwd: process.cwd(),
+			conversationId: null,
+			lastStepIdx: -1,
+			modelId: null,
+		};
+		spyOn(SessionManager.prototype, "ensure").mockResolvedValue(session);
+		const runPromptSpy = spyOn(Adapter.prototype, "runPrompt");
+
+		await expect(
+			agent.prompt(
+				{ sessionId: "s1", prompt: [{ type: "text", text: "hi" }] },
+				clientMock,
+			),
+		).rejects.toThrow(/refusing to run agy with an implicit default/i);
+		expect(runPromptSpy).not.toHaveBeenCalled();
+	});
+
+	test("setConfigOption rejects unknown models when catalog is populated", async () => {
+		const isolated = fs.mkdtempSync(
+			path.join(os.tmpdir(), "agy-unknown-model-"),
+		);
+		try {
+			fs.writeFileSync(
+				path.join(isolated, "models.json"),
+				JSON.stringify([
+					{ value: "gemini-4-neon-high", name: "Gemini 4 Neon (High)" },
+				]),
+			);
+			const isolatedAgent = new AgyAcpAgent({
+				binary: "/nonexistent-agy",
+				conversationsDir: path.join(isolated, "conversations"),
+				workingDir: isolated,
+				skipNarration: false,
+				version: "test",
+				stateDir: isolated,
+			});
+
+			await expect(
+				isolatedAgent.setConfigOption({
+					sessionId: "s1",
+					configId: "model",
+					value: "nonexistent-model",
+				}),
+			).rejects.toThrow(/unknown model: nonexistent-model/i);
+		} finally {
+			fs.rmSync(isolated, { recursive: true, force: true });
+		}
+	});
+
+	test("prompt pushes config_option_update when transcript reveals a different executed model", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-observed-model-"));
+		try {
+			const state = path.join(root, "state");
+			const conversationsDir = path.join(root, "conversations");
+			const logsDir = path.join(
+				root,
+				"brain",
+				"conv-drift",
+				".system_generated",
+				"logs",
+			);
+			fs.mkdirSync(state, { recursive: true });
+			fs.mkdirSync(conversationsDir, { recursive: true });
+			fs.mkdirSync(logsDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(state, "models.json"),
+				JSON.stringify([
+					{ value: "gemini-4-neon-high", name: "Gemini 4 Neon (High)" },
+					{ value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
+				]),
+			);
+			fs.writeFileSync(
+				path.join(logsDir, "transcript.jsonl"),
+				`${JSON.stringify({
+					type: "PLANNER_RESPONSE",
+					model: "gemini-3.8-flash-high",
+				})}\n`,
+			);
+
+			const session: any = {
+				cwd: root,
+				conversationId: null,
+				lastStepIdx: -1,
+				modelId: "gemini-4-neon-high",
+			};
+			spyOn(SessionManager.prototype, "ensure").mockResolvedValue(session);
+			spyOn(Adapter.prototype, "runPrompt").mockResolvedValue({
+				stopReason: "end_turn",
+				error: undefined,
+				conversationId: "conv-drift",
+				lastStepIdx: 1,
+				hadUpdates: true,
+			});
+
+			const isolatedAgent = new AgyAcpAgent({
+				binary: "/nonexistent-agy",
+				conversationsDir,
+				workingDir: root,
+				skipNarration: false,
+				version: "test",
+				stateDir: state,
+			});
+
+			await isolatedAgent.prompt(
+				{ sessionId: "s1", prompt: [{ type: "text", text: "hi" }] },
+				clientMock,
+			);
+
+			expect(session.modelId).toBe("gemini-3.8-flash-high");
+			const configUpdateCall = clientMock.update.mock.calls.find(
+				(call: any[]) => call[1]?.sessionUpdate === "config_option_update",
+			);
+			expect(configUpdateCall).toBeDefined();
+			const updatedModelOption = configUpdateCall[1].configOptions.find(
+				(opt: any) => opt.id === "model",
+			);
+			expect(updatedModelOption?.currentValue).toBe("gemini-3.8-flash-high");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 });

@@ -41,6 +41,7 @@ function agentFor(binary: string, dir: string) {
 		workingDir: dir,
 		skipNarration: false,
 		version: "test",
+		stateDir: path.join(dir, "state"),
 	});
 }
 

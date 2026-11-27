@@ -50,6 +50,7 @@ export interface AgentConfig {
 	workingDir: string;
 	skipNarration: boolean;
 	version: string;
+	stateDir?: string;
 }
 
 type Json = Record<string, unknown>;
@@ -68,12 +69,25 @@ export class AgyAcpAgent {
 	private readonly adapter: Adapter;
 	private readonly replayCache = new ReplayCache();
 	private readonly steerPluginReady: Promise<boolean>;
+	private readonly modelsReady: Promise<void>;
+	private readonly stateDir: string;
+	private readonly modelsCacheFile: string;
 	private availableModels: DiscoveredModel[] = [];
 	// Tracks which AcpClient is serving each session so async updates can be pushed.
 	private readonly activeClients = new Map<string, AcpClient>();
 
 	constructor(private readonly config: AgentConfig) {
-		this.sessions = new SessionManager(new SessionStore());
+		this.stateDir = config.stateDir ?? STATE_DIR;
+		this.modelsCacheFile =
+			config.stateDir !== undefined
+				? path.join(this.stateDir, "models.json")
+				: MODELS_CACHE_FILE;
+		this.sessions = new SessionManager(
+			new SessionStore(
+				path.join(this.stateDir, "sessions.json"),
+				this.stateDir,
+			),
+		);
 		this.adapter = new Adapter({
 			binary: config.binary,
 			conversationsDir: config.conversationsDir,
@@ -85,24 +99,23 @@ export class AgyAcpAgent {
 		);
 		// Attempt to load models from cache immediately for fast startup.
 		try {
-			if (fs.existsSync(MODELS_CACHE_FILE)) {
-				const cached = JSON.parse(fs.readFileSync(MODELS_CACHE_FILE, "utf-8"));
+			if (fs.existsSync(this.modelsCacheFile)) {
+				const cached = JSON.parse(
+					fs.readFileSync(this.modelsCacheFile, "utf-8"),
+				);
 				if (Array.isArray(cached) && cached.length > 0) {
 					// Normalize cached items to DiscoveredModel structure for backwards compatibility with legacy string[] cache files.
-					this.availableModels = cached.map((item: any) =>
-						typeof item === "string" ? { value: item, name: item } : item,
-					);
+					this.availableModels = cached
+						.map((item: any) =>
+							typeof item === "string" ? { value: item, name: item } : item,
+						)
+						.filter(
+							(item): item is DiscoveredModel =>
+								typeof item?.value === "string" &&
+								typeof item?.name === "string" &&
+								/^[a-z0-9][a-z0-9._-]+$/i.test(item.value),
+						);
 				}
-			}
-		} catch {
-			// ignore
-		}
-
-		// Save initial default models cache if missing
-		try {
-			if (!fs.existsSync(MODELS_CACHE_FILE)) {
-				fs.mkdirSync(STATE_DIR, { recursive: true });
-				fs.writeFileSync(MODELS_CACHE_FILE, JSON.stringify(this.availableModels));
 			}
 		} catch {
 			// ignore
@@ -110,20 +123,24 @@ export class AgyAcpAgent {
 
 		// Kick off model discovery in the background; update cache and push
 		// config_option_update to all active sessions if the list changes.
-		discoverModels(config.binary).then((models) => {
-			const changed =
-				JSON.stringify(models) !== JSON.stringify(this.availableModels);
-			if (changed && models.length > 0) {
-				this.availableModels = models;
-				this.pushConfigOptionUpdates();
-				try {
-					fs.mkdirSync(STATE_DIR, { recursive: true });
-					fs.writeFileSync(MODELS_CACHE_FILE, JSON.stringify(models));
-				} catch {
-					// ignore
+		this.modelsReady = discoverModels(config.binary)
+			.then((models) => {
+				const changed =
+					JSON.stringify(models) !== JSON.stringify(this.availableModels);
+				if (changed && models.length > 0) {
+					this.availableModels = models;
+					this.pushConfigOptionUpdates();
+					try {
+						fs.mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
+						const tmpFile = `${this.modelsCacheFile}.${process.pid}.tmp`;
+						fs.writeFileSync(tmpFile, JSON.stringify(models), { mode: 0o600 });
+						fs.renameSync(tmpFile, this.modelsCacheFile);
+					} catch {
+						// ignore
+					}
 				}
-			}
-		});
+			})
+			.catch(() => {});
 	}
 
 	// --- ACP methods ---------------------------------------------------------
@@ -199,6 +216,7 @@ export class AgyAcpAgent {
 		const cwd = params.cwd || this.config.workingDir;
 		const additionalDirs = params.additionalDirectories ?? [];
 		const { sessionId, session } = this.sessions.create(cwd, additionalDirs);
+		session.modelId = this.availableModels[0]?.value ?? null;
 		this.activeClients.set(sessionId, client);
 		this.announceSession(client, sessionId, session);
 		return { sessionId, ...this.configResult(session) };
@@ -221,6 +239,9 @@ export class AgyAcpAgent {
 		}
 		if (params.additionalDirectories) {
 			session.additionalDirs = params.additionalDirectories;
+		}
+		if (!session.modelId && this.availableModels.length > 0) {
+			session.modelId = this.availableModels[0]!.value;
 		}
 
 		if (session.conversationId) {
@@ -262,6 +283,10 @@ export class AgyAcpAgent {
 		}
 		if (params.additionalDirectories) {
 			session.additionalDirs = params.additionalDirectories;
+			dirty = true;
+		}
+		if (!session.modelId && this.availableModels.length > 0) {
+			session.modelId = this.availableModels[0]!.value;
 			dirty = true;
 		}
 		if (dirty) await this.sessions.persist(sessionId, session);
@@ -353,6 +378,22 @@ export class AgyAcpAgent {
 			return { stopReason: "end_turn" };
 		}
 
+		if (!active) {
+			let effectiveModel = this.resolveEffectiveModel(session);
+			if (effectiveModel === null) {
+				await this.modelsReady;
+				effectiveModel = this.resolveEffectiveModel(session);
+			}
+			if (effectiveModel === null) {
+				throw RequestError.internalError(
+					undefined,
+					"No Antigravity model is selected and model discovery returned no models; refusing to run agy with an implicit default.",
+				);
+			}
+			session.modelId = effectiveModel;
+		}
+
+		const requestedModelId = session.modelId;
 		const imagePaths: string[] = [];
 		let outcome: PromptOutcome | undefined;
 		try {
@@ -399,6 +440,29 @@ export class AgyAcpAgent {
 		if (outcome.conversationId !== null) {
 			session.lastStepIdx = outcome.lastStepIdx;
 			session.updatedAt = new Date().toISOString();
+			const observedModel = readObservedTurnModel(
+				this.config.conversationsDir,
+				outcome.conversationId,
+			);
+			if (
+				observedModel !== null &&
+				requestedModelId !== null &&
+				observedModel !== requestedModelId
+			) {
+				console.warn(
+					`[agy-acp] WARN: requested model "${requestedModelId}" but agy executed "${observedModel}"`,
+				);
+				session.modelId = observedModel;
+				const opts = this.configOptions(session);
+				if (opts.length > 0) {
+					await client
+						.update(sessionId, {
+							sessionUpdate: "config_option_update",
+							configOptions: opts,
+						} as never)
+						.catch(() => {});
+				}
+			}
 			await this.sessions.persist(sessionId, session);
 		}
 
@@ -442,6 +506,18 @@ export class AgyAcpAgent {
 			const value = typeof params.value === "string" ? params.value : "";
 			if (!value) throw RequestError.invalidParams(undefined, "missing value");
 			if (params.configId === MODEL_CONFIG_ID) {
+				if (this.availableModels.length === 0) {
+					await this.modelsReady;
+				}
+				if (
+					this.availableModels.length > 0 &&
+					!this.availableModels.some((m) => m.value === value)
+				) {
+					throw RequestError.invalidParams(
+						undefined,
+						`unknown model: ${value}`,
+					);
+				}
 				session.modelId = value;
 			} else if (params.configId === MODE_CONFIG_ID) {
 				session.permissionMode = value;
@@ -526,20 +602,37 @@ export class AgyAcpAgent {
 		};
 	}
 
+	private resolveEffectiveModel(session: Session): string | null {
+		if (
+			typeof session.modelId === "string" &&
+			session.modelId.trim().length > 0
+		) {
+			return session.modelId;
+		}
+		return this.availableModels[0]?.value ?? null;
+	}
+
 	private configOptions(session: Session): SessionConfigOption[] {
 		const options: SessionConfigOption[] = [];
 		const models = this.availableModels;
 
 		if (models.length > 0) {
 			const currentModel =
-				session.modelId ?? models[0]?.value ?? "gemini-3.6-flash-medium";
+				this.resolveEffectiveModel(session) ?? "gemini-3.6-flash-medium";
+			const optionItems = models.map((m) => ({
+				value: m.value,
+				name: m.name,
+			}));
+			if (!optionItems.some((item) => item.value === currentModel)) {
+				optionItems.push({ value: currentModel, name: currentModel });
+			}
 			options.push({
 				id: MODEL_CONFIG_ID,
 				name: "Model",
 				category: "model",
 				type: "select",
 				currentValue: currentModel,
-				options: models.map((m) => ({ value: m.value, name: m.name })),
+				options: optionItems,
 			});
 		}
 
@@ -724,4 +817,43 @@ function rawPromptText(prompt: unknown): string {
 		}
 	}
 	return parts.join("\n").trim();
+}
+
+/** Read the latest PLANNER_RESPONSE model recorded in agy's transcript.jsonl for a conversation. */
+export function readObservedTurnModel(
+	conversationsDir: string | undefined,
+	conversationId: string,
+): string | null {
+	if (!conversationsDir || !conversationId) return null;
+	const transcriptPath = path.join(
+		path.dirname(conversationsDir),
+		"brain",
+		conversationId,
+		".system_generated",
+		"logs",
+		"transcript.jsonl",
+	);
+	try {
+		if (!fs.existsSync(transcriptPath)) return null;
+		const lines = fs.readFileSync(transcriptPath, "utf-8").split("\n");
+		for (let i = lines.length - 1; i >= 0; i--) {
+			const line = lines[i]?.trim();
+			if (!line) continue;
+			try {
+				const entry = JSON.parse(line) as Record<string, unknown>;
+				if (
+					entry.type === "PLANNER_RESPONSE" &&
+					typeof entry.model === "string" &&
+					entry.model.trim().length > 0
+				) {
+					return entry.model.trim();
+				}
+			} catch {
+				// ignore malformed trailing line
+			}
+		}
+		return null;
+	} catch {
+		return null;
+	}
 }

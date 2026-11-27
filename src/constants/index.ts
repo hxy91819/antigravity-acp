@@ -10,7 +10,8 @@ export const CONVERSATION_DIR =
 	path.join(HOME, ".gemini", "antigravity-cli", "conversations");
 
 /** Directory holding this server's persistent state (session bindings). */
-export const STATE_DIR = path.join(HOME, ".agy-acp");
+export const STATE_DIR =
+	process.env.AGY_ACP_STATE_DIR || path.join(HOME, ".agy-acp");
 
 /** Persistent session-binding store. */
 export const SESSIONS_FILE = path.join(STATE_DIR, "sessions.json");

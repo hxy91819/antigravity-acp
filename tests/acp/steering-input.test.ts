@@ -8,7 +8,9 @@ import {
 	spyOn,
 	test,
 } from "bun:test";
-import { existsSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Adapter } from "../../src/acp/adapter";
 import { AgyAcpAgent } from "../../src/acp/agent";
 import { SessionManager } from "../../src/acp/sessions";
@@ -17,13 +19,16 @@ describe("mid-turn prompt validation", () => {
 	let agent: AgyAcpAgent;
 	let client: any;
 	let runPrompt: any;
+	let stateDir: string;
 
 	beforeEach(() => {
+		stateDir = mkdtempSync(path.join(os.tmpdir(), "agy-steer-input-state-"));
 		client = { update: mock(async () => {}) };
 		spyOn(SessionManager.prototype, "ensure").mockResolvedValue({
 			cwd: process.cwd(),
 			conversationId: "c1",
 			lastStepIdx: 1,
+			modelId: "gemini-4-neon-high",
 		} as any);
 		spyOn(Adapter.prototype, "hasActiveRun").mockReturnValue(true);
 		runPrompt = spyOn(Adapter.prototype, "runPrompt").mockResolvedValue({
@@ -34,11 +39,13 @@ describe("mid-turn prompt validation", () => {
 		agent = new AgyAcpAgent({
 			workingDir: process.cwd(),
 			skipNarration: false,
+			stateDir,
 		} as any);
 	});
 
 	afterEach(() => {
 		mock.restore();
+		rmSync(stateDir, { recursive: true, force: true });
 	});
 
 	test("keeps the full input and saves the attached image privately for the active run", async () => {
