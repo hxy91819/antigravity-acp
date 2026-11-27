@@ -1,6 +1,7 @@
 // ACP method surface for the agy agent: session lifecycle, prompting, history
 // replay, model/permission configuration.
 
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -19,6 +20,7 @@ import type {
 	SetSessionConfigOptionResponse,
 } from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
+import { BinaryReader } from "@bufbuild/protobuf/wire";
 import {
 	type DiscoveredModel,
 	detectSteerPlugin,
@@ -443,6 +445,7 @@ export class AgyAcpAgent {
 			const observedModel = readObservedTurnModel(
 				this.config.conversationsDir,
 				outcome.conversationId,
+				this.availableModels,
 			);
 			if (
 				observedModel !== null &&
@@ -819,10 +822,107 @@ function rawPromptText(prompt: unknown): string {
 	return parts.join("\n").trim();
 }
 
-/** Read the latest PLANNER_RESPONSE model recorded in agy's transcript.jsonl for a conversation. */
+const KNOWN_MODEL_ENUM_IDS: Record<number, string> = {
+	1318: "gemini-3.8-flash-high",
+	1319: "gemini-3.8-flash-medium",
+	1320: "gemini-3.8-flash-low",
+	1401: "claude-opus-5-5-medium",
+	1437: "gemini-4-carbon-medium",
+	1526: "gemini-4-hydrogen-medium",
+	1532: "gemini-4-neon-high",
+	1533: "gemini-4-neon-medium",
+	1535: "gemini-4-neon-xhigh",
+};
+
+function decodeObservedModelEnum(metadata: Uint8Array): number | null {
+	try {
+		const reader = new BinaryReader(metadata);
+		while (reader.pos < reader.len) {
+			const tag = reader.uint32();
+			const field = tag >>> 3;
+			const wire = tag & 7;
+			if (field === 9 && wire === 2) {
+				const sub = new BinaryReader(reader.bytes());
+				while (sub.pos < sub.len) {
+					const subTag = sub.uint32();
+					const subField = subTag >>> 3;
+					const subWire = subTag & 7;
+					if (subField === 1 && subWire === 0) {
+						return Number(sub.int64());
+					}
+					sub.skip(subWire);
+				}
+				return null;
+			}
+			reader.skip(wire);
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+function readObservedModelFromConversationDb(
+	conversationsDir: string,
+	conversationId: string,
+): string | null {
+	const dbPath = path.join(conversationsDir, `${conversationId}.db`);
+	if (!fs.existsSync(dbPath)) return null;
+	let db: Database | undefined;
+	try {
+		db = new Database(dbPath, { readonly: true });
+		const row = db
+			.query(
+				"SELECT metadata FROM steps WHERE step_type = 15 AND metadata IS NOT NULL ORDER BY idx DESC LIMIT 1",
+			)
+			.get() as { metadata?: Uint8Array | null } | null;
+		if (!row?.metadata) return null;
+		const modelEnum = decodeObservedModelEnum(row.metadata);
+		return modelEnum !== null ? (KNOWN_MODEL_ENUM_IDS[modelEnum] ?? null) : null;
+	} catch {
+		return null;
+	} finally {
+		try {
+			db?.close();
+		} catch {
+			// ignore close error
+		}
+	}
+}
+
+function resolveModelSelectionName(
+	displayName: string,
+	availableModels: readonly DiscoveredModel[] = [],
+): string | null {
+	const trimmed = displayName.trim();
+	if (!trimmed) return null;
+	const lower = trimmed.toLowerCase();
+	for (const model of availableModels) {
+		if (
+			model.name.toLowerCase() === lower ||
+			model.value.toLowerCase() === lower
+		) {
+			return model.value;
+		}
+	}
+	const slug = lower
+		.replace(/[()]/g, " ")
+		.replace(/\s+/g, "-")
+		.replace(/-+/g, "-")
+		.replace(/^-|-$/g, "");
+	return slug || null;
+}
+
+/**
+ * Read the latest executed model for a conversation, checking in order:
+ * 1. Latest PLANNER_RESPONSE.model in transcript.jsonl (when populated)
+ * 2. Latest step_type=15 steps.metadata[9].field1 enum in conversations/<id>.db
+ * 3. Latest Model Selection display name in transcript.jsonl
+ */
 export function readObservedTurnModel(
 	conversationsDir: string | undefined,
 	conversationId: string,
+	availableModels: readonly DiscoveredModel[] = [],
 ): string | null {
 	if (!conversationsDir || !conversationId) return null;
 	const transcriptPath = path.join(
@@ -833,27 +933,46 @@ export function readObservedTurnModel(
 		"logs",
 		"transcript.jsonl",
 	);
+	let selectionFallback: string | null = null;
 	try {
-		if (!fs.existsSync(transcriptPath)) return null;
-		const lines = fs.readFileSync(transcriptPath, "utf-8").split("\n");
-		for (let i = lines.length - 1; i >= 0; i--) {
-			const line = lines[i]?.trim();
-			if (!line) continue;
-			try {
-				const entry = JSON.parse(line) as Record<string, unknown>;
-				if (
-					entry.type === "PLANNER_RESPONSE" &&
-					typeof entry.model === "string" &&
-					entry.model.trim().length > 0
-				) {
-					return entry.model.trim();
+		if (fs.existsSync(transcriptPath)) {
+			const lines = fs.readFileSync(transcriptPath, "utf-8").split("\n");
+			for (let i = lines.length - 1; i >= 0; i--) {
+				const line = lines[i]?.trim();
+				if (!line) continue;
+				try {
+					const entry = JSON.parse(line) as Record<string, unknown>;
+					if (
+						entry.type === "PLANNER_RESPONSE" &&
+						typeof entry.model === "string" &&
+						entry.model.trim().length > 0
+					) {
+						return entry.model.trim();
+					}
+					if (selectionFallback === null && typeof entry.content === "string") {
+						const match = /Model Selection` from .*? to ([^\n]+?)\.(?:\s|$)/.exec(
+							entry.content,
+						);
+						if (match?.[1]) {
+							selectionFallback = resolveModelSelectionName(
+								match[1],
+								availableModels,
+							);
+						}
+					}
+				} catch {
+					// ignore malformed trailing line
 				}
-			} catch {
-				// ignore malformed trailing line
 			}
 		}
-		return null;
 	} catch {
-		return null;
+		// fall through to SQLite lookup
 	}
+
+	const dbModel = readObservedModelFromConversationDb(
+		conversationsDir,
+		conversationId,
+	);
+	if (dbModel !== null) return dbModel;
+	return selectionFallback;
 }

@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { Database } from "bun:sqlite";
 import {
 	afterEach,
 	beforeEach,
@@ -12,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Adapter } from "../../src/acp/adapter";
-import { AgyAcpAgent } from "../../src/acp/agent";
+import { AgyAcpAgent, readObservedTurnModel } from "../../src/acp/agent";
 import { SessionManager } from "../../src/acp/sessions";
 
 const AUTH_METHOD_ID = "agy-agent";
@@ -485,6 +486,83 @@ describe("AgyAcpAgent", () => {
 				(opt: any) => opt.id === "model",
 			);
 			expect(updatedModelOption?.currentValue).toBe("gemini-3.8-flash-high");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("readObservedTurnModel falls back to conversation SQLite metadata and decimal Model Selection when PLANNER_RESPONSE omits model", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-observed-"));
+		try {
+			const conversationsDir = path.join(root, "conversations");
+			const logsDir = path.join(
+				root,
+				"brain",
+				"conv-bot",
+				".system_generated",
+				"logs",
+			);
+			fs.mkdirSync(conversationsDir, { recursive: true });
+			fs.mkdirSync(logsDir, { recursive: true });
+
+			fs.writeFileSync(
+				path.join(logsDir, "transcript.jsonl"),
+				[
+					JSON.stringify({
+						type: "USER_INPUT",
+						content:
+							"The user changed setting `Model Selection` from None to Gemini 3.8 Flash (High). No need to comment.",
+					}),
+					JSON.stringify({
+						type: "PLANNER_RESPONSE",
+						content: "ok",
+					}),
+				].join("\n"),
+			);
+
+			// Without DB, falls back to Model Selection display name preserving decimals
+			expect(
+				readObservedTurnModel(conversationsDir, "conv-bot", [
+					{ value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
+				]),
+			).toBe("gemini-3.8-flash-high");
+
+			// With conversation SQLite DB, steps.metadata field 9 -> field 1 takes precedence
+			const encodeVarint = (n: number): number[] => {
+				const out: number[] = [];
+				let v = n;
+				while (v >= 0x80) {
+					out.push((v & 0x7f) | 0x80);
+					v = Math.floor(v / 128);
+				}
+				out.push(v);
+				return out;
+			};
+			const inner = Uint8Array.from([
+				(1 << 3) | 0,
+				...encodeVarint(1532),
+				(2 << 3) | 0,
+				...encodeVarint(18000),
+				(3 << 3) | 0,
+				...encodeVarint(40),
+			]);
+			const metadata = Uint8Array.from([
+				(9 << 3) | 2,
+				...encodeVarint(inner.length),
+				...inner,
+			]);
+			const db = new Database(path.join(conversationsDir, "conv-bot.db"));
+			db.exec(
+				"CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB)",
+			);
+			db.prepare(
+				"INSERT INTO steps (idx, step_type, metadata) VALUES (?, ?, ?)",
+			).run(1, 15, metadata);
+			db.close();
+
+			expect(readObservedTurnModel(conversationsDir, "conv-bot")).toBe(
+				"gemini-4-neon-high",
+			);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
